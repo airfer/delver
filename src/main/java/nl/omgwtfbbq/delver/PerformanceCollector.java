@@ -1,10 +1,17 @@
 package nl.omgwtfbbq.delver;
 
+import com.alibaba.fastjson.JSONObject;
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.io.FileUtils;
+
+import java.io.File;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.Writer;
+import java.text.SimpleDateFormat;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.*;
 import java.util.stream.Collectors;
 
 // TODO: do performance tests on the usage of ConcurrentHashmap.
@@ -12,6 +19,7 @@ import java.util.stream.Collectors;
 /**
  * Singleton instance to collect usages of methods.
  */
+@Slf4j
 public final class PerformanceCollector {
 
     /**
@@ -25,13 +33,80 @@ public final class PerformanceCollector {
      * method is inserted in all transformed classes, therefore the add() can be
      * called from any number of threads.
      */
-    private Map<Signature, Metric> calls = new ConcurrentHashMap<>();
+    private static Map<Signature, Metric> calls = new ConcurrentHashMap<>();
 
     private PerformanceCollector() {
     }
 
     public static PerformanceCollector instance() {
         return performanceCollector;
+    }
+
+
+    /**
+     * 声明定时线程池，用于收集失败重新收集以及热修复等场景
+     */
+    private static final ScheduledExecutorService CLIENT_SCHEDULED_POOL = new ScheduledThreadPoolExecutor(
+            1,
+            new ThreadFactoryBuilder()
+                    .setNameFormat("client-scheduled-pool-%d")
+                    .setUncaughtExceptionHandler(((t, e) -> log.error("async task execute exception, thread: {}", t.getName(), e)))
+                    .setDaemon(true)
+                    .build(),
+            new ThreadPoolExecutor.AbortPolicy()
+    );
+
+    //start scheduled job
+    static {
+        SimpleDateFormat formatter = new SimpleDateFormat("yyyy-MM-dd");
+        CLIENT_SCHEDULED_POOL.scheduleWithFixedDelay(()->{
+
+            //count call times & filter callcount = 0's method
+            List<SignatrueCalls> signatrueCallsLis=calls.keySet().stream()
+                    .filter(t -> calls.get(t).getCallCount() >0 )
+                    .map(key -> SignatrueCalls.builder()
+                            .className(key.getClassName())
+                            .method(key.getMethod())
+                            .callCount(calls.get(key).getCallCount())
+                            .average(calls.get(key).getAverage())
+                            .max(calls.get(key).getMax())
+                            .total(calls.get(key).getTotal())
+                            .build())
+                    .collect(Collectors.toList());
+
+            //write result to local
+            String fileName=String.format("delver-%s.json",formatter.format(new Date()));
+            storeResultToLocal(new JSONObject()
+                    .fluentPut("timestamp",System.currentTimeMillis())
+                    .fluentPut("res",signatrueCallsLis)
+                    .toJSONString(),fileName);
+
+        //collect every 5 min
+        },1,5, TimeUnit.MINUTES);
+    }
+
+    /**
+     * 将结果写入到本地文件中，用于后续信息的获取
+     * @param result
+     * @param fileName
+     * @return
+     */
+    public static Boolean storeResultToLocal(String result,String fileName){
+        try{
+            String folder=System.getProperty("user.home") + "/.rattler/delver";
+            if(! new File(folder).exists()){
+                //一次可以创建单级或者多级目录
+                FileUtils.forceMkdir(new File(folder));
+            }
+            File file = new File(folder + "/"+fileName);
+            //创建一个文件夹，如果由于某些原因导致不能创建，则抛出异常
+            //将结果写入文件
+            FileUtils.writeStringToFile(file,result+"\n","utf-8",true);
+            return true;
+        }catch(IOException e){
+            e.printStackTrace();
+            throw new RuntimeException("收集结果写入文件失败");
+        }
     }
 
     /**
